@@ -24,6 +24,7 @@ import logging
 import os
 import sys
 import time
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -446,7 +447,22 @@ if __name__ == "__main__":
     # 'text' is found. You can easily tweak this behavior (see below).
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir)
+        process = subprocess.Popen(["gcloud", "auth", "print-access-token"], stdout=subprocess.PIPE)
+        output, error = process.communicate()
+        access_token = str(output[:-1].decode("utf-8"))
+        base_url = "https://storage.googleapis.com/c4-datasets/c4/"
+
+        name = data_args.dataset_name #"realnewslike"
+
+        train_files = [f"{base_url}{name}/3.0.1/c4-train.{i:05}-of-00512.json.gz?access_token={access_token}"
+                       for i in range(512)]
+        validation_files = [
+            f"{base_url}{name}/3.0.1/c4-validation.{i:05}-of-00001.json.gz?access_token={access_token}" for i in range(1)]
+
+
+        datasets = {}
+        datasets["train"] = load_dataset(name, data_files=train_files, cache_dir=model_args.cache_dir)
+        datasets["validation"] = load_dataset(name, data_files=validation_files, cache_dir=model_args.cache_dir)
 
         if "validation" not in datasets.keys():
             datasets["validation"] = load_dataset(
