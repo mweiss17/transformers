@@ -149,6 +149,12 @@ class DataTrainingArguments:
         default=3.0,
         metadata={"help": "Mean span length of masked tokens"},
     )
+    shuffle_buffer_size: int = field(
+        default=10000, metadata={"help": "The number of examples to pre-load for shuffling."}
+    )
+    num_train_steps: int = field(default=50000, metadata={"help": "The number of training steps."})
+    num_eval_samples: int = field(default=50000, metadata={"help": "The number of samples to be used for evaluation"})
+
 
     def __post_init__(self):
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
@@ -561,7 +567,7 @@ if __name__ == "__main__":
         return tokenizer(examples["text"], return_attention_mask=False)
 
     tokenized_datasets = {'train': datasets['train'].map(tokenize_function, batched=True), 'validation': datasets['validation'].map(tokenize_function, batched=True)}
-    tokenized_datasets = tokenized_datasets.shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
+    tokenized_datasets['train'] = tokenized_datasets['train'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
 
     # T5-like span masked language modeling will fuse consecutively masked tokens to a single sentinel token.
     # To ensure that the input length is `max_seq_length`, we need to increase the maximum length
@@ -733,7 +739,7 @@ if __name__ == "__main__":
     validation_iter = iter(tokenized_datasets['validation'])
     training_iter = iter(tokenized_datasets['train'])
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-    eval_samples = advance_iter_and_group_samples(validation_iter, tokenized_datasets["validation"]._info.splits['validation'].num_examples, max_seq_length)
+    # eval_samples = advance_iter_and_group_samples(validation_iter, tokenized_datasets["validation"]._info.splits['validation'].num_examples, max_seq_length)
 
     train_time = 0
     steps = tqdm(range(num_train_steps), desc="Training...", position=0)
