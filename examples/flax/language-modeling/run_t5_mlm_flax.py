@@ -24,7 +24,6 @@ import logging
 import os
 import sys
 import time
-import subprocess
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -401,29 +400,16 @@ def advance_iter_and_group_samples(train_iterator, num_samples, max_seq_length):
         # concatenate tokenized samples to list
         samples = {k: samples[k] + tokenized_samples[k] for k in tokenized_samples.keys()}
 
-    # Concatenated tokens are split to lists of length `max_seq_length`.
-    # Note that remainedr of % max_seq_length are thrown away.
-    #def group_texts(examples):
-    #    result = {
-    #        k: [t[i : i + max_seq_length] for i in range(0, num_total_tokens, max_seq_length)]
-    #        for k, t in examples.items()
-    #    }
-    #    return result
     # Main data processing function that will concatenate all texts from our dataset and generate chunks of expanded_inputs_length.
     def group_texts(examples):
         # Concatenate all texts.
-        import pdb ;pdb.set_trace()
-        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        total_length = len(examples['input_ids'])
         # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
         # customize this part to your needs.
         if total_length >= expanded_inputs_length:
             total_length = (total_length // expanded_inputs_length) * expanded_inputs_length
         # Split by chunks of max_len.
-        result = {
-            k: [t[i : i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)]
-            for k, t in concatenated_examples.items()
-        }
+        result = {k: [t[i : i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)] for k, t in examples.items()}
         return result
 
     grouped_samples = group_texts(samples)
@@ -566,28 +552,16 @@ if __name__ == "__main__":
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-    # Preprocessing the datasets.
-    # First we tokenize all the texts.
-    #if training_args.do_train:
-    #    column_names = datasets["train"].column_names
-    #else:
-    #    column_names = datasets["validation"].column_names
-    #text_column_name = "text" if "text" in column_names else column_names[0]
-    text_column_name = "text"
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
+    shuffle_seed = training_args.seed
 
     # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
     # Since we make sure that all sequences are of the same length, no attention_mask is needed.
     def tokenize_function(examples):
-        return tokenizer(examples[text_column_name], return_attention_mask=False)
+        return tokenizer(examples["text"], return_attention_mask=False)
+
     tokenized_datasets = {'train': datasets['train'].map(tokenize_function, batched=True), 'validation': datasets['validation'].map(tokenize_function, batched=True)}
-    #tokenized_datasets = datasets.map(
-    #    tokenize_function,
-    #    batched=True,
-        #num_proc=data_args.preprocessing_num_workers,
-        #remove_columns=column_names, column_names=["timestamp", "url"]
-        #load_from_cache_file=not data_args.overwrite_cache,
-    #)
+    tokenized_datasets = tokenized_datasets.shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
 
     # T5-like span masked language modeling will fuse consecutively masked tokens to a single sentinel token.
     # To ensure that the input length is `max_seq_length`, we need to increase the maximum length
@@ -613,20 +587,6 @@ if __name__ == "__main__":
             for k, t in concatenated_examples.items()
         }
         return result
-
-    # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
-    # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
-    # might be slower to preprocess.
-    #
-    # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-    # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
-    # tokenized_datasets = {"train": tokenized_datasets['train'].map(group_texts, batched=True), "validation": tokenized_datasets['validation'].map(group_texts, batched=True)}
-    #tokenized_datasets = tokenized_datasets.map(
-    #    group_texts,
-    #    batched=True,
-    #    num_proc=data_args.preprocessing_num_workers,
-    #    load_from_cache_file=not data_args.overwrite_cache,
-    #)
 
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
@@ -674,7 +634,6 @@ if __name__ == "__main__":
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
     
-    #num_train_steps = len(tokenized_datasets["train"]) // train_batch_size * num_epochs
     num_train_steps = tokenized_datasets["train"]._info.splits['train'].num_examples // train_batch_size * num_epochs
     # Create learning rate schedule
     warmup_fn = optax.linear_schedule(
