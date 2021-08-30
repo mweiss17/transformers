@@ -250,12 +250,8 @@ class FlaxDataCollatorForT5MLM:
     decoder_start_token_id: int
 
     def __call__(self, examples: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
-        import pdb; pdb.set_trace()
-        #examples = dict(zip(range(len(examples)), examples))
-
         # convert list to dict and tensorize input
         batch = BatchEncoding({"input_ids": np.array(examples["input_ids"])})
-        # batch = BatchEncoding({k: np.array([examples[i][k] for i in range(len(examples))]) for k, v in examples.items()})
 
         input_ids = batch["input_ids"]
         batch_size, expandend_input_length = input_ids.shape
@@ -568,6 +564,7 @@ if __name__ == "__main__":
 
     tokenized_datasets = {'train': datasets['train'].map(tokenize_function, batched=True), 'validation': datasets['validation'].map(tokenize_function, batched=True)}
     tokenized_datasets['train'] = tokenized_datasets['train'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
+    tokenized_datasets['validation'] = tokenized_datasets['validation'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
 
     # T5-like span masked language modeling will fuse consecutively masked tokens to a single sentinel token.
     # To ensure that the input length is `max_seq_length`, we need to increase the maximum length
@@ -587,6 +584,7 @@ if __name__ == "__main__":
         # customize this part to your needs.
         if total_length >= expanded_inputs_length:
             total_length = (total_length // expanded_inputs_length) * expanded_inputs_length
+
         # Split by chunks of max_len.
         result = {
             k: [t[i : i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)]
@@ -635,12 +633,15 @@ if __name__ == "__main__":
         decoder_start_token_id=model.config.decoder_start_token_id,
     )
 
-    # Store some constant
+    # Constants
     num_epochs = int(training_args.num_train_epochs)
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
-    
-    num_train_steps = tokenized_datasets["train"]._info.splits['train'].num_examples // train_batch_size * num_epochs
+    num_train_samples = tokenized_datasets["train"]._info.splits['train'].num_examples
+    num_validation_samples = tokenized_datasets["validation"]._info.splits['validation'].num_examples
+    num_train_steps = num_train_samples // train_batch_size * num_epochs
+    num_validation_steps = num_validation_samples // train_batch_size
+
     # Create learning rate schedule
     warmup_fn = optax.linear_schedule(
         init_value=0.0, end_value=training_args.learning_rate, transition_steps=training_args.warmup_steps
@@ -739,23 +740,20 @@ if __name__ == "__main__":
     validation_iter = iter(tokenized_datasets['validation'])
     training_iter = iter(tokenized_datasets['train'])
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-    # eval_samples = advance_iter_and_group_samples(validation_iter, tokenized_datasets["validation"]._info.splits['validation'].num_examples, max_seq_length)
 
     train_time = 0
+    epoch = 0
     steps = tqdm(range(num_train_steps), desc="Training...", position=0)
     for step in range(num_train_steps):
         # ======================== Training ================================
         try:
             samples = advance_iter_and_group_samples(training_iter, train_batch_size, max_seq_length)
         except StopIteration:
-            shuffle_seed += 1
-            tokenized_datasets.set_epoch(shuffle_seed)
-
-            training_iter = iter(tokenized_datasets)
-
-            eval_dataset = advance_iter_and_group_samples(training_iter, data_args.num_eval_samples, max_seq_length)
+            epoch += 1
+            tokenized_datasets['train'].set_epoch(epoch)
+            tokenized_datasets['validation'].set_epoch(epoch)
+            training_iter = iter(tokenized_datasets['train'])
             samples = advance_iter_and_group_samples(training_iter, train_batch_size, max_seq_length)
-
 
         train_start = time.time()
         train_metrics = []
@@ -764,39 +762,40 @@ if __name__ == "__main__":
         rng, input_rng = jax.random.split(rng)
 
         # Generate an epoch by shuffling sampling indices from the train dataset
-        num_train_samples = tokenized_datasets["train"]._info.splits['train'].num_examples
-        import pdb ;pdb.set_trace() 
         model_inputs = data_collator(samples)
 
         # Model forward
         model_inputs = shard(model_inputs.data)
         state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
         train_metrics.append(train_metric)
+        import pdb ;pdb.set_trace()
 
-        cur_step = epoch * (num_train_samples // train_batch_size) + step
-
-        if cur_step % training_args.logging_steps == 0 and cur_step > 0:
+        if step % training_args.logging_steps == 0 and step > 0:
             # Save metrics
             train_metric = jax_utils.unreplicate(train_metric)
             train_time += time.time() - train_start
             if has_tensorboard and jax.process_index() == 0:
-                write_train_metric(summary_writer, train_metrics, train_time, cur_step)
+                write_train_metric(summary_writer, train_metrics, train_time, step)
 
             steps.write(
-                f"Step... ({cur_step} | Loss: {train_metric['loss'].mean()}, Learning Rate: {train_metric['learning_rate'].mean()})"
+                f"Step... ({step} | Loss: {train_metric['loss'].mean()}, Learning Rate: {train_metric['learning_rate'].mean()})"
             )
 
             train_metrics = []
 
-        if cur_step % training_args.eval_steps == 0 and cur_step > 0:
+        if step % training_args.eval_steps == 0 and step > 0:
             # ======================== Evaluating ==============================
             num_eval_samples = len(tokenized_datasets["validation"])
             eval_samples_idx = jnp.arange(num_eval_samples)
             eval_batch_idx = generate_batch_splits(eval_samples_idx, eval_batch_size)
 
             eval_metrics = []
-            for i, batch_idx in enumerate(tqdm(eval_batch_idx, desc="Evaluating ...", position=2)):
-                samples = [tokenized_datasets["validation"][int(idx)] for idx in batch_idx]
+            for _ in tqdm(range(num_validation_steps), desc="Evaluating ...", position=2):
+                try:
+                    samples = advance_iter_and_group_samples(validation_iter, train_batch_size, max_seq_length)
+                except StopIteration:
+                    validation_iter = iter(tokenized_datasets['validation'])
+
                 model_inputs = data_collator(samples)
 
                 # Model forward
@@ -809,13 +808,13 @@ if __name__ == "__main__":
             eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
             # Update progress bar
-            steps.write(f"Step... ({cur_step} | Loss: {eval_metrics['loss']}, Acc: {eval_metrics['accuracy']})")
+            steps.write(f"Step... ({step} | Loss: {eval_metrics['loss']}, Acc: {eval_metrics['accuracy']})")
 
             # Save metrics
             if has_tensorboard and jax.process_index() == 0:
-                write_eval_metric(summary_writer, eval_metrics, cur_step)
+                write_eval_metric(summary_writer, eval_metrics, step)
 
-        if cur_step % training_args.save_steps == 0 and cur_step > 0:
+        if step % training_args.save_steps == 0 and step > 0:
             # save checkpoint after each epoch and push checkpoint to the hub
             if jax.process_index() == 0:
                 params = jax.device_get(jax.tree_map(lambda x: x[0], state.params))
@@ -823,6 +822,6 @@ if __name__ == "__main__":
                     training_args.output_dir,
                     params=params,
                     push_to_hub=training_args.push_to_hub,
-                    commit_message=f"Saving weights and logs of step {cur_step}",
+                    commit_message=f"Saving weights and logs of step {step}",
                 )
         steps.update(1)
