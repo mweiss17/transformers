@@ -409,7 +409,7 @@ def advance_iter_and_group_samples(train_iterator, num_samples, max_seq_length):
         # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
         # customize this part to your needs.
         if total_length >= expanded_inputs_length:
-            total_length = (total_length // expanded_inputs_length) * expanded_inputs_length
+            total_length = (total_length // (jax.local_device_count() * expanded_inputs_length)) * jax.local_device_count() * expanded_inputs_length
         # Split by chunks of max_len.
         result = {k: [t[i : i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)] for k, t in examples.items()}
         return result
@@ -765,10 +765,10 @@ if __name__ == "__main__":
         model_inputs = data_collator(samples)
 
         # Model forward
+        import pdb ;pdb.set_trace()
         model_inputs = shard(model_inputs.data)
         state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
         train_metrics.append(train_metric)
-        import pdb ;pdb.set_trace()
 
         if step % training_args.logging_steps == 0 and step > 0:
             # Save metrics
