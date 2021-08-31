@@ -152,7 +152,7 @@ class DataTrainingArguments:
     shuffle_buffer_size: int = field(
         default=10000, metadata={"help": "The number of examples to pre-load for shuffling."}
     )
-    num_train_steps: int = field(default=50000, metadata={"help": "The number of training steps."})
+    num_train_steps: int = field(default=10000000, metadata={"help": "The number of training steps."})
     num_eval_samples: int = field(default=50000, metadata={"help": "The number of samples to be used for evaluation"})
 
 
@@ -639,7 +639,7 @@ if __name__ == "__main__":
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
     num_train_samples = tokenized_datasets["train"]._info.splits['train'].num_examples
     num_validation_samples = tokenized_datasets["validation"]._info.splits['validation'].num_examples
-    num_train_steps = num_train_samples // train_batch_size * num_epochs
+    num_train_steps = training_args.num_train_steps  #num_train_samples // train_batch_size * num_epochs
     num_validation_steps = num_validation_samples // train_batch_size
 
     # Create learning rate schedule
@@ -750,6 +750,7 @@ if __name__ == "__main__":
             samples = advance_iter_and_group_samples(training_iter, train_batch_size, max_seq_length)
         except StopIteration:
             epoch += 1
+            print(f"EPOCH! {epoch}")
             tokenized_datasets['train'].set_epoch(epoch)
             tokenized_datasets['validation'].set_epoch(epoch)
             training_iter = iter(tokenized_datasets['train'])
