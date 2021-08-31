@@ -639,7 +639,7 @@ if __name__ == "__main__":
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
     num_train_samples = tokenized_datasets["train"]._info.splits['train'].num_examples
     num_validation_samples = tokenized_datasets["validation"]._info.splits['validation'].num_examples
-    num_train_steps = training_args.num_train_steps  #num_train_samples // train_batch_size * num_epochs
+    num_train_steps = data_args.num_train_steps  #num_train_samples // train_batch_size * num_epochs
     num_validation_steps = num_validation_samples // train_batch_size
 
     # Create learning rate schedule
