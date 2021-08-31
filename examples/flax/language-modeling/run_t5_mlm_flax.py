@@ -784,9 +784,6 @@ if __name__ == "__main__":
 
         if step % training_args.eval_steps == 0 and step > 0:
             # ======================== Evaluating ==============================
-            eval_samples_idx = jnp.arange(num_validation_steps)
-            eval_batch_idx = generate_batch_splits(eval_samples_idx, eval_batch_size)
-
             eval_metrics = []
             for _ in tqdm(range(num_validation_steps), desc="Evaluating ...", position=2):
                 try:
