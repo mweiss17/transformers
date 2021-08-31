@@ -765,7 +765,6 @@ if __name__ == "__main__":
         model_inputs = data_collator(samples)
 
         # Model forward
-        import pdb ;pdb.set_trace()
         model_inputs = shard(model_inputs.data)
         state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
         train_metrics.append(train_metric)
@@ -785,8 +784,7 @@ if __name__ == "__main__":
 
         if step % training_args.eval_steps == 0 and step > 0:
             # ======================== Evaluating ==============================
-            num_eval_samples = len(tokenized_datasets["validation"])
-            eval_samples_idx = jnp.arange(num_eval_samples)
+            eval_samples_idx = jnp.arange(num_validation_steps)
             eval_batch_idx = generate_batch_splits(eval_samples_idx, eval_batch_size)
 
             eval_metrics = []
