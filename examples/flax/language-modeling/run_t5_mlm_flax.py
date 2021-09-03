@@ -39,6 +39,8 @@ import optax
 from flax import jax_utils, traverse_util
 from flax.training import train_state
 from flax.training.common_utils import get_metrics, onehot, shard
+from tensorflow.python.ops.numpy_ops import np_config
+np_config.enable_numpy_behavior()
 from transformers import (
     CONFIG_MAPPING,
     FLAX_MODEL_FOR_MASKED_LM_MAPPING,
@@ -56,7 +58,7 @@ from transformers.models.t5.modeling_flax_t5 import shift_tokens_right
 from mesh_tensorflow.transformer.dataset import pack_or_pad
 import tensorflow as tf
 import tensorflow_datasets as tfds
-import datasets
+import polytax.dataset as datasets
 import seqio
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
@@ -255,9 +257,8 @@ if __name__ == "__main__":
 
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
-    import pdb ;pdb.set_trace()
-    task = seqio.get_mixture_or_task("realnewslike.local")
-    sequence_length = {"inputs": max_seq_length, "labels": max_seq_length}
+    task = seqio.get_mixture_or_task("realnewslike.gcs")
+    sequence_length = {"inputs": max_seq_length, "targets": max_seq_length}
     train_dataset = task.get_dataset(sequence_length=sequence_length, split="train", use_cached=False, shuffle=True, seed=training_args.seed)
     eos_keys = set(k for k, f in task.output_features.items() if f.add_eos)
     train_dataset = pack_or_pad(train_dataset, sequence_length, feature_keys=task.output_features, ensure_eos=eos_keys, pack=True)
@@ -391,7 +392,6 @@ if __name__ == "__main__":
 
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
-    import pdb ;pdb.set_trace()
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
     train_time = 0
@@ -409,9 +409,6 @@ if __name__ == "__main__":
             tokenized_datasets['validation'].set_epoch(epoch)
             training_iter = iter(tokenized_datasets['train'])
             samples = advance_iter_and_group_samples(training_iter, train_batch_size, max_seq_length)
-        if step < 22402:
-            print(step)
-            continue
         import pdb; pdb.set_trace()
         train_start = time.time()
         train_metrics = []
@@ -423,8 +420,9 @@ if __name__ == "__main__":
         #model_inputs = data_collator(samples)
 
         # Model forward
-        model_inputs = shard(model_inputs.data)
-        state, train_metric, dropout_rngs = p_train_step(state, model_inputs, dropout_rngs)
+        samples = shard(samples)
+        samples["decoder_input_ids"] = shift_tokens_right(samples['targets'], model.config.pad_token_id, model.config.decoder_start_token_id)
+        state, train_metric, dropout_rngs = p_train_step(state, {"targets": samples['targets'], "input_ids": samples["inputs"], "decoder_input_ids": samples["decoder_input_ids"]}, dropout_rngs)
         train_metrics.append(train_metric)
 
         if step % training_args.logging_steps == 0 and step > 0:
