@@ -566,16 +566,20 @@ if __name__ == "__main__":
         output_features=DEFAULT_OUTPUT_FEATURES,
         metric_fns=[]) 
     import pdb ;pdb.set_trace()
-    seqio.preprocessors.tokenize
-    train_dataset = datasets[0].batch(32).prefetch(tf.data.AUTOTUNE)
-    trian_dataset.map(encode)
-    train_data_tokenized = datasets[0].map(encode_map_fn)
+    task = seqio.get_mixture_or_task("realnewslike")
+    train_dataset = task.get_dataset(sequence_length={"inputs": max_seq_length, "targets": max_seq_length}, split="train", use_cached=False, shuffle=True, seed=training_args.seed)
+    from mesh_tensorflow.transformer.dataset import pack_or_pad
+    sequence_length = {"inputs": 512, "targets": 114}
+    eos_keys = set(k for k, f in task.output_features.items() if f.add_eos)
+    train_dataset = pack_or_pad(train_dataset, sequence_length, feature_keys=task.output_features, ensure_eos=eos_keys, pack=True)
 
-    tokenized_datasets = {'train': datasets[0].map(tokenize_function), 'validation': datasets[1].map(tokenize_function)}
+    train_dataset = train_dataset.batch(32).prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
+    
+    # tokenized_datasets = {'train': datasets[0].map(tokenize_function), 'validation': datasets[1].map(tokenize_function)}
 
     #tokenized_datasets = {'train': datasets['train'].map(tokenize_function, batched=True), 'validation': datasets['validation'].map(tokenize_function, batched=True)}
-    tokenized_datasets['train'] = tokenized_datasets['train'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
-    tokenized_datasets['validation'] = tokenized_datasets['validation'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
+    #tokenized_datasets['train'] = tokenized_datasets['train'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
+    #tokenized_datasets['validation'] = tokenized_datasets['validation'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
 
     # T5-like span masked language modeling will fuse consecutively masked tokens to a single sentinel token.
     # To ensure that the input length is `max_seq_length`, we need to increase the maximum length
@@ -650,10 +654,9 @@ if __name__ == "__main__":
     num_epochs = int(training_args.num_train_epochs)
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
-    num_train_samples = tokenized_datasets["train"]._info.splits['train'].num_examples
-    num_validation_samples = tokenized_datasets["validation"]._info.splits['validation'].num_examples
+    #num_train_samples = tokenized_datasets["train"]._info.splits['train'].num_examples
+    #num_validation_samples = tokenized_datasets["validation"]._info.splits['validation'].num_examples
     num_train_steps = data_args.num_train_steps  #num_train_samples // train_batch_size * num_epochs
-    num_validation_steps = num_validation_samples // train_batch_size
 
     # Create learning rate schedule
     warmup_fn = optax.linear_schedule(
@@ -704,7 +707,7 @@ if __name__ == "__main__":
         dropout_rng, new_dropout_rng = jax.random.split(dropout_rng)
 
         def loss_fn(params):
-            labels = batch.pop("labels")
+            labels = batch.pop("targets")
 
             logits = state.apply_fn(**batch, params=params, dropout_rng=dropout_rng, train=True)[0]
 
@@ -749,9 +752,8 @@ if __name__ == "__main__":
 
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
-
-    validation_iter = iter(tokenized_datasets['validation'])
-    training_iter = iter(tokenized_datasets['train'])
+    import pdb ;pdb.set_trace()
+    #validation_iter = iter(tokenized_datasets['validation'])
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
     train_time = 0
@@ -760,7 +762,8 @@ if __name__ == "__main__":
     for step in range(num_train_steps):
         # ======================== Training ================================
         try:
-            samples = advance_iter_and_group_samples(training_iter, train_batch_size, max_seq_length)
+            samples = next(train_dataset)
+            #samples = advance_iter_and_group_samples(training_iter, train_batch_size, max_seq_length)
         except StopIteration:
             epoch += 1
             print(f"EPOCH! {epoch}")
@@ -779,7 +782,7 @@ if __name__ == "__main__":
         rng, input_rng = jax.random.split(rng)
 
         # Generate an epoch by shuffling sampling indices from the train dataset
-        model_inputs = data_collator(samples)
+        #model_inputs = data_collator(samples)
 
         # Model forward
         model_inputs = shard(model_inputs.data)
@@ -802,11 +805,12 @@ if __name__ == "__main__":
         if step % training_args.eval_steps == 0 and step > 0:
             # ======================== Evaluating ==============================
             eval_metrics = []
-            for _ in tqdm(range(num_validation_steps), desc="Evaluating ...", position=2):
+            for _ in tqdm(range(data_args.num_eval_steps), desc="Evaluating ...", position=2):
                 try:
                     samples = advance_iter_and_group_samples(validation_iter, train_batch_size, max_seq_length)
                 except StopIteration:
                     validation_iter = iter(tokenized_datasets['validation'])
+                    break
 
                 model_inputs = data_collator(samples)
 
