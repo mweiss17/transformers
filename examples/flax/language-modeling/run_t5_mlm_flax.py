@@ -24,17 +24,12 @@ import logging
 import os
 import sys
 import time
-from collections import defaultdict
+import functools
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
-
 import numpy as np
-from datasets import load_dataset
 from tqdm import tqdm
-import tensorflow as tf
-import transformers 
-import seqio
 
 import flax
 import jax
@@ -58,7 +53,11 @@ from transformers import (
     set_seed,
 )
 from transformers.models.t5.modeling_flax_t5 import shift_tokens_right
-
+from mesh_tensorflow.transformer.dataset import pack_or_pad
+import tensorflow as tf
+import tensorflow_datasets as tfds
+import datasets
+import seqio
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -172,265 +171,6 @@ class DataTrainingArguments:
                 assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
 
 
-def compute_input_and_target_lengths(inputs_length, noise_density, mean_noise_span_length):
-    """This function is copy of `random_spans_helper <https://github.com/google-research/text-to-text-transfer-transformer/blob/84f8bcc14b5f2c03de51bd3587609ba8f6bbd1cd/t5/data/preprocessors.py#L2466>`__ .
-
-    Training parameters to avoid padding with random_spans_noise_mask.
-    When training a model with random_spans_noise_mask, we would like to set the other
-    training hyperparmeters in a way that avoids padding.
-    This function helps us compute these hyperparameters.
-    We assume that each noise span in the input is replaced by extra_tokens_per_span_inputs sentinel tokens,
-    and each non-noise span in the targets is replaced by extra_tokens_per_span_targets sentinel tokens.
-    This function tells us the required number of tokens in the raw example (for split_tokens())
-    as well as the length of the encoded targets. Note that this function assumes
-    the inputs and targets will have EOS appended and includes that in the reported length.
-
-    Args:
-        inputs_length: an integer - desired length of the tokenized inputs sequence
-        noise_density: a float
-        mean_noise_span_length: a float
-    Returns:
-        tokens_length: length of original text in tokens
-        targets_length: an integer - length in tokens of encoded targets sequence
-    """
-
-    def _tokens_length_to_inputs_length_targets_length(tokens_length):
-        num_noise_tokens = int(round(tokens_length * noise_density))
-        num_nonnoise_tokens = tokens_length - num_noise_tokens
-        num_noise_spans = int(round(num_noise_tokens / mean_noise_span_length))
-        # inputs contain all nonnoise tokens, sentinels for all noise spans
-        # and one EOS token.
-        _input_length = num_nonnoise_tokens + num_noise_spans + 1
-        _output_length = num_noise_tokens + num_noise_spans + 1
-        return _input_length, _output_length
-
-    tokens_length = inputs_length
-
-    while _tokens_length_to_inputs_length_targets_length(tokens_length + 1)[0] <= inputs_length:
-        tokens_length += 1
-
-    inputs_length, targets_length = _tokens_length_to_inputs_length_targets_length(tokens_length)
-
-    # minor hack to get the targets length to be equal to inputs length
-    # which is more likely to have been set to a nice round number.
-    if noise_density == 0.5 and targets_length > inputs_length:
-        tokens_length -= 1
-        targets_length -= 1
-    return tokens_length, targets_length
-
-
-@flax.struct.dataclass
-class FlaxDataCollatorForT5MLM:
-    """
-    Data collator used for T5 span-masked language modeling.
-    It is made sure that after masking the inputs are of length `data_args.max_seq_length` and targets are also of fixed length.
-    For more information on how T5 span-masked language modeling works, one can take a look
-    at the `official paper <https://arxiv.org/pdf/1910.10683.pdf>`__
-    or the `official code for preprocessing <https://github.com/google-research/text-to-text-transfer-transformer/blob/master/t5/data/preprocessors.py>`__ .
-
-    Args:
-        tokenizer (:class:`~transformers.PreTrainedTokenizer` or :class:`~transformers.PreTrainedTokenizerFast`):
-            The tokenizer used for encoding the data.
-        noise_density (:obj:`float`):
-            The probability with which to (randomly) mask tokens in the input.
-        mean_noise_span_length (:obj:`float`):
-            The average span length of the masked tokens.
-        input_length (:obj:`int`):
-            The expected input length after masking.
-        target_length (:obj:`int`):
-            The expected target length after masking.
-        pad_token_id: (:obj:`int`):
-            The pad token id of the model
-        decoder_start_token_id: (:obj:`int):
-            The decoder start token id of the model
-    """
-
-    tokenizer: PreTrainedTokenizerBase
-    noise_density: float
-    mean_noise_span_length: float
-    input_length: int
-    target_length: int
-    pad_token_id: int
-    decoder_start_token_id: int
-
-    def __call__(self, examples: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
-        # convert list to dict and tensorize input
-        batch = BatchEncoding({"input_ids": np.array(examples["input_ids"])})
-
-        input_ids = batch["input_ids"]
-        batch_size, expandend_input_length = input_ids.shape
-
-        mask_indices = np.asarray([self.random_spans_noise_mask(expandend_input_length) for i in range(batch_size)])
-        labels_mask = ~mask_indices
-
-        input_ids_sentinel = self.create_sentinel_ids(mask_indices.astype(np.int8))
-        labels_sentinel = self.create_sentinel_ids(labels_mask.astype(np.int8))
-
-        batch["input_ids"] = self.filter_input_ids(input_ids, input_ids_sentinel)
-        batch["labels"] = self.filter_input_ids(input_ids, labels_sentinel)
-
-        if batch["input_ids"].shape[-1] != self.input_length:
-            raise ValueError(
-                f"`input_ids` are incorrectly preprocessed. `input_ids` length is {batch['input_ids'].shape[-1]}, but should be {self.target_length}."
-            )
-
-        if batch["labels"].shape[-1] != self.target_length:
-            raise ValueError(
-                f"`labels` are incorrectly preprocessed. `labels` length is {batch['labels'].shape[-1]}, but should be {self.target_length}."
-            )
-
-        # to check that tokens are correctly proprocessed, one can run `self.tokenizer.batch_decode(input_ids)` and `self.tokenizer.batch_decode(labels)` here...
-        batch["decoder_input_ids"] = shift_tokens_right(
-            batch["labels"], self.pad_token_id, self.decoder_start_token_id
-        )
-
-        return batch
-
-    def create_sentinel_ids(self, mask_indices):
-        """
-        Sentinel ids creation given the indices that should be masked.
-        The start indices of each mask are replaced by the sentinel ids in increasing
-        order. Consecutive mask indices to be deleted are replaced with `-1`.
-        """
-        start_indices = mask_indices - np.roll(mask_indices, 1, axis=-1) * mask_indices
-        start_indices[:, 0] = mask_indices[:, 0]
-
-        sentinel_ids = np.where(start_indices != 0, np.cumsum(start_indices, axis=-1), start_indices)
-        sentinel_ids = np.where(sentinel_ids != 0, (sentinel_ids + self.tokenizer.vocab_size - 1), 0)
-        sentinel_ids -= mask_indices - start_indices
-
-        return sentinel_ids
-
-    def filter_input_ids(self, input_ids, sentinel_ids):
-        """
-        Puts sentinel mask on `input_ids` and fuse consecutive mask tokens into a single mask token by deleting.
-        This will reduce the sequence length from `expanded_inputs_length` to `input_length`.
-        """
-        batch_size = input_ids.shape[0]
-
-        input_ids_full = np.where(sentinel_ids != 0, sentinel_ids, input_ids)
-        input_ids = input_ids_full[input_ids_full > 0].reshape((batch_size, -1))
-        input_ids = np.concatenate(
-            [input_ids, np.full((batch_size, 1), self.tokenizer.eos_token_id, dtype=np.int32)], axis=-1
-        )
-        return input_ids
-
-    def random_spans_noise_mask(self, length):
-
-        """This function is copy of `random_spans_helper <https://github.com/google-research/text-to-text-transfer-transformer/blob/84f8bcc14b5f2c03de51bd3587609ba8f6bbd1cd/t5/data/preprocessors.py#L2682>`__ .
-
-        Noise mask consisting of random spans of noise tokens.
-        The number of noise tokens and the number of noise spans and non-noise spans
-        are determined deterministically as follows:
-        num_noise_tokens = round(length * noise_density)
-        num_nonnoise_spans = num_noise_spans = round(num_noise_tokens / mean_noise_span_length)
-        Spans alternate between non-noise and noise, beginning with non-noise.
-        Subject to the above restrictions, all masks are equally likely.
-
-        Args:
-            length: an int32 scalar (length of the incoming token sequence)
-            noise_density: a float - approximate density of output mask
-            mean_noise_span_length: a number
-
-        Returns:
-            a boolean tensor with shape [length]
-        """
-
-        orig_length = length
-
-        num_noise_tokens = int(np.round(length * self.noise_density))
-        # avoid degeneracy by ensuring positive numbers of noise and nonnoise tokens.
-        num_noise_tokens = min(max(num_noise_tokens, 1), length - 1)
-        num_noise_spans = int(np.round(num_noise_tokens / self.mean_noise_span_length))
-
-        # avoid degeneracy by ensuring positive number of noise spans
-        num_noise_spans = max(num_noise_spans, 1)
-        num_nonnoise_tokens = length - num_noise_tokens
-
-        # pick the lengths of the noise spans and the non-noise spans
-        def _random_segmentation(num_items, num_segments):
-            """Partition a sequence of items randomly into non-empty segments.
-            Args:
-                num_items: an integer scalar > 0
-                num_segments: an integer scalar in [1, num_items]
-            Returns:
-                a Tensor with shape [num_segments] containing positive integers that add
-                up to num_items
-            """
-            mask_indices = np.arange(num_items - 1) < (num_segments - 1)
-            np.random.shuffle(mask_indices)
-            first_in_segment = np.pad(mask_indices, [[1, 0]])
-            segment_id = np.cumsum(first_in_segment)
-            # count length of sub segments assuming that list is sorted
-            _, segment_length = np.unique(segment_id, return_counts=True)
-            return segment_length
-
-        noise_span_lengths = _random_segmentation(num_noise_tokens, num_noise_spans)
-        nonnoise_span_lengths = _random_segmentation(num_nonnoise_tokens, num_noise_spans)
-
-        interleaved_span_lengths = np.reshape(
-            np.stack([nonnoise_span_lengths, noise_span_lengths], axis=1), [num_noise_spans * 2]
-        )
-        span_starts = np.cumsum(interleaved_span_lengths)[:-1]
-        span_start_indicator = np.zeros((length,), dtype=np.int8)
-        span_start_indicator[span_starts] = True
-        span_num = np.cumsum(span_start_indicator)
-        is_noise = np.equal(span_num % 2, 1)
-
-        return is_noise[:orig_length]
-
-DEFAULT_SPM_PATH = "gs://t5-data/vocabs/cc_all.32000/sentencepiece.model"  # GCS
-DEFAULT_EXTRA_IDS = 100
-
-
-def get_default_vocabulary():
-      return seqio.SentencePieceVocabulary(DEFAULT_SPM_PATH, DEFAULT_EXTRA_IDS)
-
-
-def generate_batch_splits(samples_idx: jnp.ndarray, batch_size: int) -> jnp.ndarray:
-    num_samples = len(samples_idx)
-    samples_to_remove = num_samples % batch_size
-
-    if samples_to_remove != 0:
-        samples_idx = samples_idx[:-samples_to_remove]
-    sections_split = num_samples // batch_size
-    batch_idx = np.split(samples_idx, sections_split)
-    return batch_idx
-
-def advance_iter_and_group_samples(train_iterator, num_samples, max_seq_length):
-    """
-    The training iterator is advanced so that after groupifying the samples,
-    `num_samples` of length `max_seq_length` are returned.
-    """
-    
-    num_total_tokens = max_seq_length * num_samples
-    samples = defaultdict(list)
-    start = time.time()
-    i = 0
-    import pdb ;pdb.set_trace()
-    while i < num_total_tokens:
-        tokenized_samples = next(train_iterator)
-        i += len(tokenized_samples["input_ids"])
-
-        # concatenate tokenized samples to list
-        samples = {k: samples[k] + tokenized_samples[k] for k in tokenized_samples.keys()}
-    import pdb; pdb.set_trace()
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of expanded_inputs_length.
-    def group_texts(examples):
-        # Concatenate all texts.
-        total_length = len(examples['input_ids'])
-        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-        # customize this part to your needs.
-        if total_length >= expanded_inputs_length:
-            total_length = (total_length // (jax.local_device_count() * expanded_inputs_length)) * jax.local_device_count() * expanded_inputs_length
-        # Split by chunks of max_len.
-        result = {k: [t[i : i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)] for k, t in examples.items()}
-        return result
-    grouped_samples = group_texts(samples)
-
-    return grouped_samples
-
-
 def write_train_metric(summary_writer, train_metrics, train_time, step):
     summary_writer.scalar("train_time", train_time, step)
 
@@ -486,26 +226,7 @@ if __name__ == "__main__":
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
-    # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files, this script will use the column called 'text' or the first column if no column called
-    # 'text' is found. You can easily tweak this behavior (see below).
-    if data_args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        #datasets = load_dataset("/home/martin/datasets/datasets/c4/c4.py", data_args.dataset_name, cache_dir=model_args.cache_dir, streaming=True)
-        import tensorflow_datasets as tfds
-        #datasets = tfds.load(name="c4/realnewslike", split=["train", "validation"], data_dir="gs://c4-datasets/")
-        builder = tfds.builder('c4/realnewslike', data_dir="gs://c4-datasets/")
-        train_dataset = builder.as_dataset(split='train', decoders=tfds.decode.PartialDecoding({"text": True}))
-        train_dataset = train_dataset.batch(32).prefetch(10)
-
-        #datasets["train"] = load_dataset(name, data_files=train_files, cache_dir=model_args.cache_dir)
-        #datasets["validation"] = load_dataset(name, data_files=validation_files, cache_dir=model_args.cache_dir)
-
     # Load pretrained model and tokenizer
-
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.tokenizer_name, cache_dir=model_args.cache_dir, use_fast=model_args.use_fast_tokenizer
@@ -533,81 +254,14 @@ if __name__ == "__main__":
         logger.warning("You are instantiating a new config instance from scratch.")
 
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-    shuffle_seed = training_args.seed
 
-    # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
-    # Since we make sure that all sequences are of the same length, no attention_mask is needed.
-    def tokenize_function(examples):
-        return tokenizer(str(examples["text"].numpy()), return_attention_mask=False)
-    
-    # Encoding functions
-    def encode(text_tensor):
-        encoded_text = tokenizer(str(text_tensor['text'].numpy()), return_attention_mask=False)
-        return encoded_text
-    DEFAULT_OUTPUT_FEATURES = {
-        "inputs": seqio.Feature(
-            vocabulary=get_default_vocabulary(), add_eos=True,
-            required=False),
-        "targets": seqio.Feature(
-            vocabulary=get_default_vocabulary(), add_eos=True)
-    } 
-    from t5.data import preprocessors
-    import functools
-    seqio.TaskRegistry.add(
-        "realnewslike",
-        seqio.TfdsDataSource(tfds_name="c4/realnewslike:3.0.1", tfds_data_dir="gs://c4-datasets/"),
-        preprocessors=[
-            functools.partial(preprocessors.rekey, key_map={"inputs": None, "targets": "text"}),
-            seqio.preprocessors.tokenize, 
-            seqio.CacheDatasetPlaceholder(),
-            preprocessors.span_corruption,
-            seqio.preprocessors.append_eos_after_trim,
-        ],
-        output_features=DEFAULT_OUTPUT_FEATURES,
-        metric_fns=[]) 
     import pdb ;pdb.set_trace()
-    task = seqio.get_mixture_or_task("realnewslike")
-    train_dataset = task.get_dataset(sequence_length={"inputs": max_seq_length, "targets": max_seq_length}, split="train", use_cached=False, shuffle=True, seed=training_args.seed)
-    from mesh_tensorflow.transformer.dataset import pack_or_pad
-    sequence_length = {"inputs": 512, "targets": 114}
+    task = seqio.get_mixture_or_task("realnewslike.local")
+    sequence_length = {"inputs": max_seq_length, "labels": max_seq_length}
+    train_dataset = task.get_dataset(sequence_length=sequence_length, split="train", use_cached=False, shuffle=True, seed=training_args.seed)
     eos_keys = set(k for k, f in task.output_features.items() if f.add_eos)
     train_dataset = pack_or_pad(train_dataset, sequence_length, feature_keys=task.output_features, ensure_eos=eos_keys, pack=True)
-
     train_dataset = train_dataset.batch(32).prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
-    
-    # tokenized_datasets = {'train': datasets[0].map(tokenize_function), 'validation': datasets[1].map(tokenize_function)}
-
-    #tokenized_datasets = {'train': datasets['train'].map(tokenize_function, batched=True), 'validation': datasets['validation'].map(tokenize_function, batched=True)}
-    #tokenized_datasets['train'] = tokenized_datasets['train'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
-    #tokenized_datasets['validation'] = tokenized_datasets['validation'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
-
-    # T5-like span masked language modeling will fuse consecutively masked tokens to a single sentinel token.
-    # To ensure that the input length is `max_seq_length`, we need to increase the maximum length
-    # according to `mlm_probability` and `mean_noise_span_length`. We can also define the label length accordingly.
-    expanded_inputs_length, targets_length = compute_input_and_target_lengths(
-        inputs_length=max_seq_length,
-        noise_density=data_args.mlm_probability,
-        mean_noise_span_length=data_args.mean_noise_span_length,
-    )
-
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of expanded_inputs_length.
-    def group_texts(examples):
-        # Concatenate all texts.
-        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-        # customize this part to your needs.
-        if total_length >= expanded_inputs_length:
-            total_length = (total_length // expanded_inputs_length) * expanded_inputs_length
-
-        # Split by chunks of max_len.
-        result = {
-            k: [t[i : i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)]
-            for k, t in concatenated_examples.items()
-        }
-        if len(result['input_ids']) > 232:
-            result['input_ids'] = result['input_ids'][:232]
-        return result
 
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
@@ -638,25 +292,10 @@ if __name__ == "__main__":
     else:
         model = FlaxT5ForConditionalGeneration(config, seed=training_args.seed, dtype=getattr(jnp, model_args.dtype))
 
-    # Data collator
-    # This one will take care of randomly masking the tokens.
-    data_collator = FlaxDataCollatorForT5MLM(
-        tokenizer=tokenizer,
-        noise_density=data_args.mlm_probability,
-        mean_noise_span_length=data_args.mean_noise_span_length,
-        input_length=max_seq_length,
-        target_length=targets_length,
-        pad_token_id=model.config.pad_token_id,
-        decoder_start_token_id=model.config.decoder_start_token_id,
-    )
-
     # Constants
     num_epochs = int(training_args.num_train_epochs)
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
-    #num_train_samples = tokenized_datasets["train"]._info.splits['train'].num_examples
-    #num_validation_samples = tokenized_datasets["validation"]._info.splits['validation'].num_examples
-    num_train_steps = data_args.num_train_steps  #num_train_samples // train_batch_size * num_epochs
 
     # Create learning rate schedule
     warmup_fn = optax.linear_schedule(
@@ -665,7 +304,7 @@ if __name__ == "__main__":
     decay_fn = optax.linear_schedule(
         init_value=training_args.learning_rate,
         end_value=0,
-        transition_steps=num_train_steps - training_args.warmup_steps,
+        transition_steps=data_args.num_train_steps - training_args.warmup_steps,
     )
     linear_decay_lr_schedule_fn = optax.join_schedules(
         schedules=[warmup_fn, decay_fn], boundaries=[training_args.warmup_steps]
@@ -753,13 +392,12 @@ if __name__ == "__main__":
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
     import pdb ;pdb.set_trace()
-    #validation_iter = iter(tokenized_datasets['validation'])
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
     train_time = 0
     epoch = 0
-    steps = tqdm(range(num_train_steps), desc="Training...", position=0)
-    for step in range(num_train_steps):
+    steps = tqdm(range(data_args.num_train_steps), desc="Training...", position=0)
+    for step in range(data_args.num_train_steps):
         # ======================== Training ================================
         try:
             samples = next(train_dataset)
