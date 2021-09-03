@@ -32,10 +32,14 @@ from typing import Dict, List, Optional
 import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
+import tensorflow as tf
+import transformers 
+import seqio
 
 import flax
 import jax
 import jax.numpy as jnp
+import jax.profiler
 import optax
 from flax import jax_utils, traverse_util
 from flax.training import train_state
@@ -375,6 +379,13 @@ class FlaxDataCollatorForT5MLM:
 
         return is_noise[:orig_length]
 
+DEFAULT_SPM_PATH = "gs://t5-data/vocabs/cc_all.32000/sentencepiece.model"  # GCS
+DEFAULT_EXTRA_IDS = 100
+
+
+def get_default_vocabulary():
+      return seqio.SentencePieceVocabulary(DEFAULT_SPM_PATH, DEFAULT_EXTRA_IDS)
+
 
 def generate_batch_splits(samples_idx: jnp.ndarray, batch_size: int) -> jnp.ndarray:
     num_samples = len(samples_idx)
@@ -391,17 +402,19 @@ def advance_iter_and_group_samples(train_iterator, num_samples, max_seq_length):
     The training iterator is advanced so that after groupifying the samples,
     `num_samples` of length `max_seq_length` are returned.
     """
+    
     num_total_tokens = max_seq_length * num_samples
     samples = defaultdict(list)
-
+    start = time.time()
     i = 0
+    import pdb ;pdb.set_trace()
     while i < num_total_tokens:
         tokenized_samples = next(train_iterator)
         i += len(tokenized_samples["input_ids"])
 
         # concatenate tokenized samples to list
         samples = {k: samples[k] + tokenized_samples[k] for k in tokenized_samples.keys()}
-
+    import pdb; pdb.set_trace()
     # Main data processing function that will concatenate all texts from our dataset and generate chunks of expanded_inputs_length.
     def group_texts(examples):
         # Concatenate all texts.
@@ -413,8 +426,8 @@ def advance_iter_and_group_samples(train_iterator, num_samples, max_seq_length):
         # Split by chunks of max_len.
         result = {k: [t[i : i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)] for k, t in examples.items()}
         return result
-
     grouped_samples = group_texts(samples)
+
     return grouped_samples
 
 
@@ -460,7 +473,7 @@ if __name__ == "__main__":
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-        level="NOTSET",
+        level=logging.INFO,
         datefmt="[%X]",
     )
 
@@ -481,50 +494,15 @@ if __name__ == "__main__":
     # 'text' is found. You can easily tweak this behavior (see below).
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        datasets = load_dataset("/home/martin/datasets/datasets/c4/c4.py", data_args.dataset_name, cache_dir=model_args.cache_dir, streaming=True)
+        #datasets = load_dataset("/home/martin/datasets/datasets/c4/c4.py", data_args.dataset_name, cache_dir=model_args.cache_dir, streaming=True)
+        import tensorflow_datasets as tfds
+        #datasets = tfds.load(name="c4/realnewslike", split=["train", "validation"], data_dir="gs://c4-datasets/")
+        builder = tfds.builder('c4/realnewslike', data_dir="gs://c4-datasets/")
+        train_dataset = builder.as_dataset(split='train', decoders=tfds.decode.PartialDecoding({"text": True}))
+        train_dataset = train_dataset.batch(32).prefetch(10)
 
         #datasets["train"] = load_dataset(name, data_files=train_files, cache_dir=model_args.cache_dir)
         #datasets["validation"] = load_dataset(name, data_files=validation_files, cache_dir=model_args.cache_dir)
-
-        if "validation" not in datasets.keys():
-            datasets["validation"] = load_dataset(
-                data_args.dataset_name,
-                data_args.dataset_config_name,
-                split=f"train[:{data_args.validation_split_percentage}%]",
-                cache_dir=model_args.cache_dir,
-            )
-            datasets["train"] = load_dataset(
-                data_args.dataset_name,
-                data_args.dataset_config_name,
-                split=f"train[{data_args.validation_split_percentage}%:]",
-                cache_dir=model_args.cache_dir,
-            )
-    else:
-        data_files = {}
-        if data_args.train_file is not None:
-            data_files["train"] = data_args.train_file
-        if data_args.validation_file is not None:
-            data_files["validation"] = data_args.validation_file
-        extension = data_args.train_file.split(".")[-1]
-        if extension == "txt":
-            extension = "text"
-        datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
-
-        if "validation" not in datasets.keys():
-            datasets["validation"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[:{data_args.validation_split_percentage}%]",
-                cache_dir=model_args.cache_dir,
-            )
-            datasets["train"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[{data_args.validation_split_percentage}%:]",
-                cache_dir=model_args.cache_dir,
-            )
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
 
     # Load pretrained model and tokenizer
 
@@ -541,7 +519,7 @@ if __name__ == "__main__":
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
-
+    
     if model_args.config_name:
         config = T5Config.from_pretrained(
             model_args.config_name, cache_dir=model_args.cache_dir, vocab_size=len(tokenizer)
@@ -560,9 +538,42 @@ if __name__ == "__main__":
     # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
     # Since we make sure that all sequences are of the same length, no attention_mask is needed.
     def tokenize_function(examples):
-        return tokenizer(examples["text"], return_attention_mask=False)
+        return tokenizer(str(examples["text"].numpy()), return_attention_mask=False)
+    
+    # Encoding functions
+    def encode(text_tensor):
+        encoded_text = tokenizer(str(text_tensor['text'].numpy()), return_attention_mask=False)
+        return encoded_text
+    DEFAULT_OUTPUT_FEATURES = {
+        "inputs": seqio.Feature(
+            vocabulary=get_default_vocabulary(), add_eos=True,
+            required=False),
+        "targets": seqio.Feature(
+            vocabulary=get_default_vocabulary(), add_eos=True)
+    } 
+    from t5.data import preprocessors
+    import functools
+    seqio.TaskRegistry.add(
+        "realnewslike",
+        seqio.TfdsDataSource(tfds_name="c4/realnewslike:3.0.1", tfds_data_dir="gs://c4-datasets/"),
+        preprocessors=[
+            functools.partial(preprocessors.rekey, key_map={"inputs": None, "targets": "text"}),
+            seqio.preprocessors.tokenize, 
+            seqio.CacheDatasetPlaceholder(),
+            preprocessors.span_corruption,
+            seqio.preprocessors.append_eos_after_trim,
+        ],
+        output_features=DEFAULT_OUTPUT_FEATURES,
+        metric_fns=[]) 
+    import pdb ;pdb.set_trace()
+    seqio.preprocessors.tokenize
+    train_dataset = datasets[0].batch(32).prefetch(tf.data.AUTOTUNE)
+    trian_dataset.map(encode)
+    train_data_tokenized = datasets[0].map(encode_map_fn)
 
-    tokenized_datasets = {'train': datasets['train'].map(tokenize_function, batched=True), 'validation': datasets['validation'].map(tokenize_function, batched=True)}
+    tokenized_datasets = {'train': datasets[0].map(tokenize_function), 'validation': datasets[1].map(tokenize_function)}
+
+    #tokenized_datasets = {'train': datasets['train'].map(tokenize_function, batched=True), 'validation': datasets['validation'].map(tokenize_function, batched=True)}
     tokenized_datasets['train'] = tokenized_datasets['train'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
     tokenized_datasets['validation'] = tokenized_datasets['validation'].shuffle(buffer_size=data_args.shuffle_buffer_size, seed=shuffle_seed)
 
@@ -590,6 +601,8 @@ if __name__ == "__main__":
             k: [t[i : i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)]
             for k, t in concatenated_examples.items()
         }
+        if len(result['input_ids']) > 232:
+            result['input_ids'] = result['input_ids'][:232]
         return result
 
     # Enable tensorboard only on the master node
@@ -754,7 +767,10 @@ if __name__ == "__main__":
             tokenized_datasets['validation'].set_epoch(epoch)
             training_iter = iter(tokenized_datasets['train'])
             samples = advance_iter_and_group_samples(training_iter, train_batch_size, max_seq_length)
-
+        if step < 22402:
+            print(step)
+            continue
+        import pdb; pdb.set_trace()
         train_start = time.time()
         train_metrics = []
 
@@ -820,3 +836,5 @@ if __name__ == "__main__":
                     commit_message=f"Saving weights and logs of step {step}",
                 )
         steps.update(1)
+        jax.profiler.save_device_memory_profile(f"memory-step-{step}.prof")
+
