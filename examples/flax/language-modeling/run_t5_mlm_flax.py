@@ -158,7 +158,7 @@ class DataTrainingArguments:
         default=10000, metadata={"help": "The number of examples to pre-load for shuffling."}
     )
     num_train_steps: int = field(default=10000000, metadata={"help": "The number of training steps."})
-    num_eval_samples: int = field(default=50000, metadata={"help": "The number of samples to be used for evaluation"})
+    num_eval_samples: int = field(default=50, metadata={"help": "The number of samples to be used for evaluation"})
 
 
     def __post_init__(self):
@@ -259,10 +259,16 @@ if __name__ == "__main__":
 
     task = seqio.get_mixture_or_task("realnewslike.gcs")
     sequence_length = {"inputs": max_seq_length, "targets": max_seq_length}
-    train_dataset = task.get_dataset(sequence_length=sequence_length, split="train", use_cached=False, shuffle=True, seed=training_args.seed)
+    train_dataset = task.get_dataset(sequence_length=sequence_length, split="train", num_epochs=10, use_cached=False, shuffle=True, seed=training_args.seed)
     eos_keys = set(k for k, f in task.output_features.items() if f.add_eos)
     train_dataset = pack_or_pad(train_dataset, sequence_length, feature_keys=task.output_features, ensure_eos=eos_keys, pack=True)
     train_dataset = train_dataset.batch(32).prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
+
+    validation_dataset = task.get_dataset(sequence_length=sequence_length, split="validation", num_epochs=100000, use_cached=False, shuffle=True, seed=training_args.seed)
+    eos_keys = set(k for k, f in task.output_features.items() if f.add_eos)
+    validation_dataset = pack_or_pad(validation_dataset, sequence_length, feature_keys=task.output_features, ensure_eos=eos_keys, pack=True)
+    validation_dataset = validation_dataset.batch(32).prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
+
 
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
@@ -372,7 +378,7 @@ if __name__ == "__main__":
 
     # Define eval fn
     def eval_step(params, batch):
-        labels = batch.pop("labels")
+        labels = batch.pop("targets")
 
         logits = model(**batch, params=params, train=False)[0]
 
@@ -399,17 +405,7 @@ if __name__ == "__main__":
     steps = tqdm(range(data_args.num_train_steps), desc="Training...", position=0)
     for step in range(data_args.num_train_steps):
         # ======================== Training ================================
-        try:
-            samples = next(train_dataset)
-            #samples = advance_iter_and_group_samples(training_iter, train_batch_size, max_seq_length)
-        except StopIteration:
-            epoch += 1
-            print(f"EPOCH! {epoch}")
-            tokenized_datasets['train'].set_epoch(epoch)
-            tokenized_datasets['validation'].set_epoch(epoch)
-            training_iter = iter(tokenized_datasets['train'])
-            samples = advance_iter_and_group_samples(training_iter, train_batch_size, max_seq_length)
-        import pdb; pdb.set_trace()
+        samples = next(train_dataset)
         train_start = time.time()
         train_metrics = []
 
@@ -437,24 +433,16 @@ if __name__ == "__main__":
             )
 
             train_metrics = []
-
         if step % training_args.eval_steps == 0 and step > 0:
             # ======================== Evaluating ==============================
             eval_metrics = []
-            for _ in tqdm(range(data_args.num_eval_steps), desc="Evaluating ...", position=2):
-                try:
-                    samples = advance_iter_and_group_samples(validation_iter, train_batch_size, max_seq_length)
-                except StopIteration:
-                    validation_iter = iter(tokenized_datasets['validation'])
-                    break
-
-                model_inputs = data_collator(samples)
-
-                # Model forward
-                model_inputs = shard(model_inputs.data)
-                metrics = p_eval_step(state.params, model_inputs)
+            for step in tqdm(range(data_args.num_eval_samples), desc="Evaluating ...", position=2):
+            #for samples in tqdm(validation_dataset, desc="Evaluating ...", position=2):
+                samples = next(validation_dataset)
+                samples = shard(samples)
+                samples["decoder_input_ids"] = shift_tokens_right(samples['targets'], model.config.pad_token_id, model.config.decoder_start_token_id)
+                metrics = p_eval_step(state.params, {"targets": samples['targets'], "input_ids": samples["inputs"], "decoder_input_ids": samples["decoder_input_ids"]})
                 eval_metrics.append(metrics)
-
             # get eval metrics
             eval_metrics = get_metrics(eval_metrics)
             eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
@@ -477,5 +465,6 @@ if __name__ == "__main__":
                     commit_message=f"Saving weights and logs of step {step}",
                 )
         steps.update(1)
-        jax.profiler.save_device_memory_profile(f"memory-step-{step}.prof")
+        # save memory profile
+        # jax.profiler.save_device_memory_profile(f"memory-step-{step}.prof")
 
