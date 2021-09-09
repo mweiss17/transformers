@@ -257,7 +257,7 @@ if __name__ == "__main__":
 
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
-    task = seqio.get_mixture_or_task("realnewslike.gcs")
+    task = seqio.get_mixture_or_task(data_args.dataset_name)
     sequence_length = {"inputs": max_seq_length, "targets": max_seq_length}
     train_dataset = task.get_dataset(sequence_length=sequence_length, split="train", use_cached=False, shuffle=True, seed=training_args.seed)
     eos_keys = set(k for k, f in task.output_features.items() if f.add_eos)
